@@ -1,0 +1,99 @@
+\section{ОПТИМИЗАЦИЯ АЛГОРИТМА С ИСПОЛЬЗОВАНИЕМ MPI}
+
+Исходный код оптимизированного с помощью MPI алгоритма решения задачи \eqref{eq:1} с помощью блочного разложения Холецкого представлен в Листинге \ref{listing:cholesky_mpi_block}. Рассмотрим каким образом оптимизируются этапы решения задачи (разложение Холецкого и обратная подстановка).
+
+\subsection{ОПТИМИЗАЦИЯ РАЗЛОЖЕНИЯ ХОЛЕЦКОГО С ИСПОЛЬЗОВАНИЕМ MPI}
+
+При оптимизации блочной версии разложения Холецкого с использованием MPI блоки столбцов матрицы $\vb{A}$ ${A}\qty(i:n,\,i:\min(i+n_b-1,n))$, где $i=1,\, n_b,\, 2n_b,\, \ldots,\, n$, распределяются по процессам так, что блок ${A}\qty(i:n,\,i:\min(i+n_b-1,n))$ принадлежит процессу под номером $\mathrm{mod}\qty((i-1)/b,\, n_{proc})$, где $n_{proc}$ --- число процессов, $n_b$ --- ширина блока. Такое распределение происходит в строчках кода, приведенных в Листинге \ref{listing:l_init}, при этом вместо матрицы $\vb{A}$ рассматривается матрица $\vb{L}$, ненулевые элементы которой задаются как элементы нижней треугольной части матрицы $\vb{A}$.
+\begin{lstlisting}[language=fortran, style=fortran, label={listing:l_init}, caption={Инициализация и распределение блоков столбцов матрицы $\vb{L}$ по процессам. Ненулевые блоки матрицы $\vb{L}$ задаются как блоки нижней треугольной части матрицы $\vb{A}$.}]
+   ! Initialization of the matrix L and distribution it between processes
+   allocate(l(n,n))
+   l(:,:) = 0.0
+   do i = rank * nb + 1, n, nb * nproc
+      j = min(i + nb - 1, n)
+      l(i:n, i:j) = a(i:n, i:j)
+   end do
+\end{lstlisting}
+
+Далее в цикле по $i$ последовательно рассматривается блок столбцов ${A}(i:n,$ $i:\min(i+n_b-1,n))$. Сначала вычисляется разложение Холецкого обычным способом для диагонального блока ${A}\qty(i:\min(i+n_b-1,n),\,i:\min(i+n_b-1,n))$, для чего применяется подпрограмма \texttt{cholesky\_serial}. Потом происходит преобразование, описанное в Разделе \ref{sec:cholesky} в пункте 3. Для этого используется подпрограмма \texttt{updating\_l\_21}, в которой решается СЛАУ на $\vb{X}$
+$$
+\vb{X} \vb{L}^T_{11} = \vb{A}_{21}
+$$
+с нижней треугольной матрицей $\vb{L}_{11}$. После этого найденная матрица замещает блок \texttt{l(j+1:n, i:j)}, где \texttt{j = min(i+nb-1, n)}. Блок \texttt{l(j+1:n, i:j)} преобразуется в одномерный массив \texttt{l\_massage} и рассылается широковещательной рассылкой (с помощью \texttt{MPI\_BCAST}) от процесса, которому принадлежит блок \texttt{l(j+1:n, i:j)}, на все остальные процессы. После рассылки одномерный массив \texttt{l\_massage} преобразуется в блок \texttt{l\_21} и выполняется преобразование, описанное в Разделе \ref{sec:cholesky} в пункте 4. Так как каждый процесс владеет своей частью обновляемого в пункте 4 массива, это позволяет провести вычисления в пункте 4 параллельно. Данным вычислениям соответствует код, представленный в Листинге \ref{listing:4}.
+\begin{lstlisting}[language=fortran, style=fortran, label={listing:4}, caption={Параллельная реализация преобразования, описанного в Разделе \ref{sec:cholesky} в пункте 4.}]
+! Updating the other blocks of the L matrix
+do k = i + nb, n, nb
+   p = min(k + nb - 1, n)
+   ! Updating the (k:n, k:p) block
+   if (mod( (k - 1) / nb, nproc ) .eq. rank) then
+      l(k:n, k:p) = l(k:n, k:p) - matmul(l_21(k:n, i:j), &
+         transpose(l_21(k:p, i:j)))
+   end if
+end do
+\end{lstlisting}
+
+\subsection{ОПТИМИЗАЦИЯ ОБРАТНОЙ ПОДСТАНОВКИ С ИСПОЛЬЗОВАНИЕМ MPI}
+
+При обратной подстановке оказывается неудобным тот факт, что матрица $\vb{L}$ не хранится в каждом процессе целиком, поэтому сперва матрица $\vb{L}$ распространяется на все процессы. Это делается в части кода, представленной в Листинге \ref{listing:l_broadcasting}, где блок столбцов, принадлежащий какому-то одному процессу, сохраняется в виде одномерного массива \texttt{l\_massage}, потом делается широковещательная рассылка этого массива и обратное преобразование из \texttt{l\_massage} в блок столбцов, который теперь хранится в каждом процессе.
+\begin{lstlisting}[language=fortran, style=fortran, label={listing:l_broadcasting}, caption={Распространение фактора Холецкого $\vb{L}$ на все процессы.}]
+   ! Broadcasting the matrix L
+   do i = 1, n, nb
+      j = min(i + nb - 1, n)
+      allocate(l_massage(n * (j - i + 1)))
+      l_massage(:) = 0.0
+      if (mod( (i-1)/nb, nproc ) .eq. rank) then
+         ! Filling l_massage with the (1:n, i:j) block
+         do s = 1, n
+            do t = 1, j-i+1
+               l_massage((s-1)*(j-i+1) + t) = l(s, i-1+t)
+            end do
+         end do
+      end if
+      call MPI_BARRIER(MPI_COMM_WORLD, ierr)
+      ! Broadcasting l_massage to other processes
+      call MPI_BCAST(l_massage, n * (j-i+2), MPI_REAL, &
+         mod( (i-1)/nb, nproc ), MPI_COMM_WORLD, ierr)
+      if (rank .ne. mod( (i-1)/nb, nproc )) then
+         ! Filling the block (1:n, i:j) with l_massage
+         do s = 1, n
+            do t = 1, j-i+1
+               l(s, i-1+t) = l_massage((s-1)*(j-i+1) + t)
+            end do
+         end do
+      end if
+      deallocate(l_massage)
+   end do
+\end{lstlisting}
+
+После распространения матрицы $\vb{L}$ на все процессы происходит сама обратная подстановка. Она реализуется параллельно, при этом процесс с рангом \texttt{rank} находит столбцы \texttt{y(:,i)} и \texttt{x(:,i)}, где \texttt{i=rank+1}, \texttt{rank+1+nproc}, \texttt{rank+1+2*nproc} и так далее до \texttt{m=10}. Исходный код этапа обратной подстановки представлен в Листинге \ref{listing:bs_||}.
+\begin{lstlisting}[language=fortran, style=fortran, label={listing:bs_||}, caption={Исходный код этапа обратной подстановки в оптимизированной с помощью MPI версии алгоритма.}]
+   ! Backward substitution
+   do i = rank + 1, m, nproc
+      ! Finding y(:,i)
+      y(1,i) = b(1,i) / l(1,1)
+      do j = 2, n
+         y(j,i) = b(j,i)
+         do k = 1, j - 1
+            y(j,i) = y(j,i) - l(j,k) * y(k,i)
+         end do
+         y(j,i) = y(j,i) / l(j,j)
+      end do
+      ! Finding x(:,i)
+      x(n,i) = y(n,i) / l(n,n)
+      do j = n-1, 1, -1
+         x(j,i) = y(j,i)
+         do k = j+1, n
+            x(j,i) = x(j,i) - l(k,j) * x(k,i)
+         end do
+         x(j,i) = x(j,i) / l(j,j)
+      end do 
+   end do
+\end{lstlisting}
+
+\subsection{ИНИЦИАЛИЗАЦИЯ МАТРИЦЫ A}
+
+Важно отметить, что матрица $\vb{A}$ всегда инициализируется следующим образом
+\begin{equation}
+    \vb{A} = \vb{B} + n \vb{I},
+\end{equation}
+где $\vb{B}$ --- $n\times n$ матрица, каждый элемент которой равен 1, $\vb{I}$ --- единичная $n\times n$ матрица.
